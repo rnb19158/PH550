@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+BEC-Cavity Coupled System Simulator (RK2 Version):
+ - Implements coupled Lugiato-Lefever Equation (LLE) for the optical field
+   and Gross-Pitaevskii Equation (GPE) for the BEC field.
+ - Equations based on Model Handbook Sec. 10.1 (Eqs. 31 & 32).
+ - Uses physical parameters (e.g., for Cesium in a cavity) to derive
+   dimensionless simulation parameters.
+ - Includes structured light pump profiles (LG, Top-Hat) and selectable
+   initial BEC profile (Homogeneous/Thomas-Fermi).
+ - Includes absorbing boundaries and atom number monitoring.
+ - MODIFIED: Uses a second-order Runge-Kutta (RK2) integrator for the
+   nonlinear step, consistent with Model Handbook Sec. 1.2.5.
+"""
+
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+from scipy.special import assoc_laguerre
+import scipy.constants as const
+
+###############################################################################
+# Physical Constants and Unit Conversions
+###############################################################################
+
+# Fundamental constants
+c_light = const.c               # Speed of light [m/s]
+hbar = const.hbar               # Reduced Planck constant [J·s]
+epsilon_0 = const.epsilon_0     # Vacuum permittivity [F/m]
+a_0 = const.physical_constants['Bohr radius'][0]  # Bohr radius [m]
+
+# Cesium-133 parameters
+m_Cs = 132.90545196 * const.atomic_mass # Cesium mass [kg]
+lambda_Cs_D2 = 852.34727582e-9      # D2 line wavelength [m]
+d_Cs = 2.989e-29                # Dipole moment [C·m] for Cs D2 transition
+
+###############################################################################
+# Physical to Dimensionless Parameter Functions
+###############################################################################
+
+def calculate_dimensionless_parameters(physical_params):
+    """
+    Calculate dimensionless parameters from physical inputs.
+    Based on Model Handbook Sec. 10.1 scaling relationships.
+    """
+    p = physical_params
+
+    # Convert units
+    w_s = p['w_s_um'] * 1e-6
+    delta_omega_cavity = 2 * np.pi * p['cavity_detuning_MHz'] * 1e6
+    Delta_atom_light = 2 * np.pi * p['atom_detuning_MHz'] * 1e6
+    a_s = p['scattering_length_a0'] * a_0
+
+    # Derived quantities
+    k_L_pump = 2 * np.pi / p['wavelength_m']
+    kappa = (c_light * p['T_mirror']) / (2 * p['cavity_length_m'])
+    
+    # Dimensionless parameters (Model Handbook Eqs. 37-42)
+    theta_mh = -2 * delta_omega_cavity * p['cavity_length_m'] / (c_light * p['T_mirror'])
+    alpha_F = (2 * p['cavity_length_m']) / (k_L_pump * w_s**2 * p['T_mirror'])
+    beta_F = (2 * p['medium_length_m']) / (k_L_pump * w_s**2 * p['T_mirror'])
+    alpha_psi = hbar / (p['atom_mass_kg'] * w_s**2)
+    beta_dd = 2 / (3 * k_L_pump**2 * w_s**2)
+
+    if abs(Delta_atom_light) < 1e-9:
+        print("Warning: Atom-light detuning is zero. Beta_col might be ill-defined.")
+        beta_col = np.inf 
+    else:
+        mu_squared = p['dipole_moment_Cm']**2
+        beta_col = (16 * np.pi * epsilon_0 * hbar * a_s * np.abs(Delta_atom_light)) / (k_L_pump**2 * mu_squared)
+
+    s = -1 if Delta_atom_light < 0 else (1 if Delta_atom_light > 0 else 0)
+    bec_gpe_scaling_factor = alpha_psi / kappa
+    suggested_dt_dimensionless = (1e-7) * kappa
+
+    return {
+        'theta': theta_mh, 'alpha_F': alpha_F, 'beta_F': beta_F,
+        'beta_dd': beta_dd, 'beta_col': beta_col, 's': s,
+        'alpha_psi': alpha_psi, 'kappa_timescale': kappa,
+        'bec_gpe_prefactor': bec_gpe_scaling_factor,
+        'suggested_dt': suggested_dt_dimensionless,
+        'w_s_meters': w_s, 'k_L_pump_inv_meters': k_L_pump
+    }
+
+###############################################################################
+# Utility & Simulation Functions
+###############################################################################
+
+def create_absorbing_boundaries(X, Y, Lx, Ly, boundary_width_factor=0.1, boundary_strength=5.0):
+    """Creates smooth absorbing boundaries using a tanh profile."""
+    norm_x = np.abs(X / (Lx / 2))
+    norm_y = np.abs(Y / (Ly / 2))
+    ramp_x = 0.5 * (1 - np.tanh(boundary_strength * (norm_x - (1 - boundary_width_factor)) / boundary_width_factor))
+    ramp_y = 0.5 * (1 - np.tanh(boundary_strength * (norm_y - (1 - boundary_width_factor)) / boundary_width_factor))
+    return (ramp_x * ramp_y).astype(np.float32)
+
+def generate_noise(Nx, Ny, amp, noise_amplitude, dtype=np.complex64):
+    """Creates a field of random complex noise."""
+    noise_re = np.random.uniform(-1, 1, (Ny, Nx)).astype(np.float32)
+    noise_im = np.random.uniform(-1, 1, (Ny, Nx)).astype(np.float32)
+    return (amp * noise_amplitude * (noise_re + 1j * noise_im)).astype(dtype)
+
+def calculate_spectrum_log(field):
+    """Calculate the spatial power spectrum in log scale."""
+    spec = np.abs(np.fft.fftshift(np.fft.fft2(field)))**2
+    return np.log10(spec + 1e-9)
+
+def setup_output_directories(output_directory):
+    """Create directories for output."""
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+    plot_directory = os.path.join(output_directory, 'plots')
+    if not os.path.exists(plot_directory):
+        os.makedirs(plot_directory)
+    return plot_directory
+
+def setup_real_time_viz(Nx, Ny, x_phys_um, y_phys_um, kx_plot_shifted_um_inv, ky_plot_shifted_um_inv, k_zoom_factor=1.5):
+    """Initializes a figure with 6 subplots for real-time visualization."""
+    plt.ion()
+    fig, ax = plt.subplots(2, 3, figsize=(18, 10))
+    real_extent = [x_phys_um.min(), x_phys_um.max(), y_phys_um.min(), y_phys_um.max()]
+    k_extent = [kx_plot_shifted_um_inv.min() * k_zoom_factor, kx_plot_shifted_um_inv.max() * k_zoom_factor,
+                ky_plot_shifted_um_inv.min() * k_zoom_factor, ky_plot_shifted_um_inv.max() * k_zoom_factor]
+    
+    im_bec_amp = ax[0, 0].imshow(np.zeros((Ny, Nx)), origin='lower', extent=real_extent, cmap='viridis')
+    fig.colorbar(im_bec_amp, ax=ax[0, 0]); ax[0, 0].set_title('BEC Amplitude (|Ψ|)'); ax[0, 0].set_xlabel('x [μm]')
+    im_bec_phase = ax[0, 1].imshow(np.zeros((Ny, Nx)), origin='lower', extent=real_extent, cmap='hsv', vmin=-np.pi, vmax=np.pi)
+    fig.colorbar(im_bec_phase, ax=ax[0, 1]); ax[0, 1].set_title('BEC Phase (arg(Ψ))'); ax[0, 1].set_xlabel('x [μm]')
+    im_bec_spec = ax[0, 2].imshow(np.zeros((Ny, Nx)), origin='lower', extent=k_extent, cmap='magma')
+    fig.colorbar(im_bec_spec, ax=ax[0, 2]); ax[0, 2].set_title('BEC Power Spectrum'); ax[0, 2].set_xlabel('k$_x$ [μm$^{-1}$]')
+    
+    im_opt_amp = ax[1, 0].imshow(np.zeros((Ny, Nx)), origin='lower', extent=real_extent, cmap='viridis')
+    fig.colorbar(im_opt_amp, ax=ax[1, 0]); ax[1, 0].set_title('Optical Amplitude (|A|)'); ax[1, 0].set_xlabel('x [μm]')
+    im_opt_phase = ax[1, 1].imshow(np.zeros((Ny, Nx)), origin='lower', extent=real_extent, cmap='hsv', vmin=-np.pi, vmax=np.pi)
+    fig.colorbar(im_opt_phase, ax=ax[1, 1]); ax[1, 1].set_title('Optical Phase (arg(A))'); ax[1, 1].set_xlabel('x [μm]')
+    im_opt_spec = ax[1, 2].imshow(np.zeros((Ny, Nx)), origin='lower', extent=k_extent, cmap='magma')
+    fig.colorbar(im_opt_spec, ax=ax[1, 2]); ax[1, 2].set_title('Optical Power Spectrum'); ax[1, 2].set_xlabel('k$_x$ [μm$^{-1}$]')
+    
+    fig.tight_layout(); plt.pause(0.01)
+    return fig, (im_bec_amp, im_bec_phase, im_bec_spec, im_opt_amp, im_opt_phase, im_opt_spec)
+
+def update_real_time_viz(fig, im_handles, psi_field, a_field, t_tau):
+    """Updates the real-time visualization plots."""
+    im_bec_amp, im_bec_phase, im_bec_spec, im_opt_amp, im_opt_phase, im_opt_spec = im_handles
+    bec_amp, bec_phs, bec_log_spec = np.abs(psi_field), np.angle(psi_field), calculate_spectrum_log(psi_field)
+    opt_amp, opt_phs, opt_log_spec = np.abs(a_field), np.angle(a_field), calculate_spectrum_log(a_field)
+    
+    im_bec_amp.set_data(bec_amp); im_bec_amp.set_clim(0, bec_amp.max() or 1.0)
+    im_bec_phase.set_data(bec_phs)
+    im_bec_spec.set_data(bec_log_spec); im_bec_spec.set_clim(np.min(bec_log_spec), np.max(bec_log_spec) if np.ptp(bec_log_spec) > 1e-9 else np.min(bec_log_spec) + 1.0)
+    
+    im_opt_amp.set_data(opt_amp); im_opt_amp.set_clim(0, opt_amp.max() or 1.0)
+    im_opt_phase.set_data(opt_phs)
+    im_opt_spec.set_data(opt_log_spec); im_opt_spec.set_clim(np.min(opt_log_spec), np.max(opt_log_spec) if np.ptp(opt_log_spec) > 1e-9 else np.min(opt_log_spec) + 1.0)
+    
+    fig.suptitle(f"Dimensionless Time τ = {t_tau:.2f}"); fig.canvas.draw_idle(); fig.canvas.flush_events()
+
+def save_fields_plots(Psi, A, directory, filename_prefix, x_phys_um, y_phys_um, kx_plot_shifted_um_inv, ky_plot_shifted_um_inv, k_zoom_factor=1.5):
+    """Saves a comprehensive plot of the current field states."""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    real_extent = [x_phys_um.min(), x_phys_um.max(), y_phys_um.min(), y_phys_um.max()]
+    k_extent = [kx_plot_shifted_um_inv.min()*k_zoom_factor, kx_plot_shifted_um_inv.max()*k_zoom_factor,
+                ky_plot_shifted_um_inv.min()*k_zoom_factor, ky_plot_shifted_um_inv.max()*k_zoom_factor]
+
+    bec_amp, bec_phs, bec_log_spec = np.abs(Psi), np.angle(Psi), calculate_spectrum_log(Psi)
+    opt_amp, opt_phs, opt_log_spec = np.abs(A), np.angle(A), calculate_spectrum_log(A)
+
+    im0 = axes[0,0].imshow(bec_amp, origin='lower', extent=real_extent, cmap='viridis'); fig.colorbar(im0, ax=axes[0,0]); axes[0,0].set_title('BEC Amp'); im0.set_clim(0, bec_amp.max() or 1.0)
+    im1 = axes[0,1].imshow(bec_phs, origin='lower', extent=real_extent, cmap='hsv', vmin=-np.pi, vmax=np.pi); fig.colorbar(im1, ax=axes[0,1]); axes[0,1].set_title('BEC Phase')
+    im2 = axes[0,2].imshow(bec_log_spec, origin='lower', extent=k_extent, cmap='magma'); fig.colorbar(im2, ax=axes[0,2]); axes[0,2].set_title('BEC Spectrum'); im2.set_clim(np.min(bec_log_spec), np.max(bec_log_spec) if np.ptp(bec_log_spec) > 1e-9 else np.min(bec_log_spec) + 1.0)
+    
+    im3 = axes[1,0].imshow(opt_amp, origin='lower', extent=real_extent, cmap='viridis'); fig.colorbar(im3, ax=axes[1,0]); axes[1,0].set_title('Optical Amp'); im3.set_clim(0, opt_amp.max() or 1.0)
+    im4 = axes[1,1].imshow(opt_phs, origin='lower', extent=real_extent, cmap='hsv', vmin=-np.pi, vmax=np.pi); fig.colorbar(im4, ax=axes[1,1]); axes[1,1].set_title('Optical Phase')
+    im5 = axes[1,2].imshow(opt_log_spec, origin='lower', extent=k_extent, cmap='magma'); fig.colorbar(im5, ax=axes[1,2]); axes[1,2].set_title('Optical Spectrum'); im5.set_clim(np.min(opt_log_spec), np.max(opt_log_spec) if np.ptp(opt_log_spec) > 1e-9 else np.min(opt_log_spec) + 1.0)
+
+    for ax in axes.flat: ax.set_xlabel('x [μm]'); ax.set_ylabel('y [μm]')
+    axes[0,2].set_xlabel('k$_x$ [μm$^{-1}$]'); axes[1,2].set_xlabel('k$_x$ [μm$^{-1}$]');
+    axes[0,2].set_ylabel('k$_y$ [μm$^{-1}$]'); axes[1,2].set_ylabel('k$_y$ [μm$^{-1}$]');
+
+    plt.suptitle(filename_prefix.replace("_", " ").title()); plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(os.path.join(directory, f"{filename_prefix}.png"), dpi=150); plt.close(fig)
+
+def save_simulation_info(output_directory, params_dict, finished=False):
+    """Saves simulation parameters to a text file."""
+    info_file = os.path.join(output_directory, "simulation_info.txt")
+    with open(info_file, 'a') as f:
+        if not finished:
+            f.write(f"BEC-Cavity Sim (START) - {datetime.now()}\n{'='*50}\nParameters:\n")
+            for k, v in params_dict.items(): f.write(f"  {k} = {v}\n")
+        else:
+            f.write(f"\n{'='*50}\nBEC-Cavity Sim (END) - {datetime.now()}\n")
+
+def monitor_conservation(Psi, dx_um, dy_um, initial_atom_number=None):
+    """Monitors the relative change in total atom number."""
+    current_atom_number = np.sum(np.abs(Psi)**2) * dx_um * dy_um
+    change_percent = 0.0
+    if initial_atom_number is not None and initial_atom_number > 1e-12:
+        change_percent = (current_atom_number / initial_atom_number - 1) * 100
+    return current_atom_number, change_percent
+
+###############################################################################
+# Structured Field Generation Functions
+###############################################################################
+def generate_lg_pump(X, Y, F_amp, w0_phys, l, p, noise_factor):
+    """Generates a Laguerre-Gaussian (LG) pump beam."""
+    r_sq = X**2 + Y**2; w0_phys_sq = w0_phys**2
+    if w0_phys_sq < 1e-9: return np.zeros_like(X, dtype=np.complex64)
+    radial_norm_sq = r_sq / w0_phys_sq; phi = np.arctan2(Y, X)
+    laguerre_poly = assoc_laguerre(2 * radial_norm_sq, p, np.abs(l))
+    lg_profile = (np.sqrt(radial_norm_sq))**np.abs(l) * laguerre_poly * np.exp(-radial_norm_sq) * np.exp(1j * l * phi)
+    max_abs = np.max(np.abs(lg_profile))
+    norm_lg = F_amp * (lg_profile / max_abs if max_abs > 1e-9 else lg_profile)
+    return norm_lg.astype(np.complex64) + generate_noise(X.shape[1], X.shape[0], F_amp, noise_factor)
+
+def generate_tophat_pump(X, Y, F_amp, radius, steepness, noise_factor, add_oam=False, oam_l=0):
+    """Generates a Top-Hat pump beam."""
+    r = np.sqrt(X**2 + Y**2)
+    profile = F_amp * 0.5 * (1 - np.tanh(steepness * (r - radius)))
+    if add_oam: profile *= np.exp(1j * oam_l * np.arctan2(Y, X))
+    return profile.astype(np.complex64) + generate_noise(X.shape[1], X.shape[0], F_amp, noise_factor)
+
+def generate_thomas_fermi_bec(X, Y, Psi_amp, tf_radius, noise_factor):
+    """Generates a Thomas-Fermi initial BEC profile."""
+    r_sq = X**2 + Y**2; tf_radius_sq = tf_radius**2
+    if tf_radius_sq < 1e-9: profile = np.zeros_like(X, dtype=np.float32)
+    else: profile = Psi_amp * (1 - r_sq / tf_radius_sq); profile[profile < 0] = 0
+    return profile.astype(np.complex64) + generate_noise(X.shape[1], X.shape[0], Psi_amp, noise_factor)
+
+###############################################################################
+# Nonlinear Step Calculation (for RK2)
+###############################################################################
+def calculate_nonlinear_derivatives(Psi, A, F_P, nl_params):
+    """
+    Calculates the nonlinear derivatives for the coupled LLE-GPE system.
+    This is the right-hand side of the equations for the real-space step.
+    """
+    # Unpack parameters for clarity
+    gpe_prefactor = nl_params['gpe_prefactor']
+    beta_F = nl_params['beta_F']
+    s = nl_params['s']
+    beta_dd = nl_params['beta_dd']
+    sigma = nl_params['sigma']
+    beta_col = nl_params['beta_col']
+    L_3 = nl_params['L_3']
+    
+    # Pre-calculate squared magnitudes to avoid re-computation
+    abs_Psi_sq = np.abs(Psi)**2
+    abs_A_sq = np.abs(A)**2
+
+    # --- Nonlinear part of the LLE (for optical field A) ---
+    # This corresponds to the coupling term in Eq. 31 of the handbook
+    nl_A_coupling = -1j * beta_F * (s * abs_Psi_sq - beta_dd * abs_Psi_sq**2) / (1.0 + sigma * abs_A_sq + 1e-12)
+    dAdt_nl = (nl_A_coupling * A) + F_P
+
+    # --- Nonlinear part of the GPE (for BEC field Psi) ---
+    # This corresponds to the terms inside the bracket in Eq. 32 of the handbook
+    nl_Psi_terms = (-1j * s * abs_A_sq + 
+                    1j * 2.0 * beta_dd * abs_A_sq * abs_Psi_sq - 
+                    1j * beta_col * abs_Psi_sq - 
+                    L_3 * abs_Psi_sq**2)
+    dPsidt_nl = gpe_prefactor * (nl_Psi_terms * Psi)
+
+    return dPsidt_nl, dAdt_nl
+
+###############################################################################
+# Main Simulation
+###############################################################################
+def main():
+    # -----------------------------
+    # Define Physical Parameters
+    # -----------------------------
+    physical_params = {
+        'wavelength_m': 720e-9, 'w_s_um': 10.0,
+        'cavity_length_m': 10e-3, 'medium_length_m': 100e-6,
+        'T_mirror': 0.01, 'cavity_detuning_MHz': 0.0,
+        'atom_wavelength_m': lambda_Cs_D2, 'atom_detuning_MHz': -1000.0,
+        'dipole_moment_Cm': d_Cs, 'atom_mass_kg': m_Cs,
+        'scattering_length_a0': 12.0,
+    }
+    
+    calc_params = calculate_dimensionless_parameters(physical_params)
+    
+    # Pack dimensionless parameters for the simulation
+    nl_params = {
+        'theta': calc_params['theta'], 'alpha_F': calc_params['alpha_F'],
+        'beta_F': calc_params['beta_F'], 's': calc_params['s'],
+        'beta_dd': 0.0, # Neglect dipole-dipole as per handbook example
+        'beta_col': calc_params['beta_col'],
+        'gpe_prefactor': calc_params['bec_gpe_prefactor'],
+        'sigma': 0.0, # Neglect optical saturation
+        'L_3': 1.0e-4, # Dimensionless three-body loss
+    }
+    
+    F_amp_dimless = 4.0
+    Psi_amp_dimless = 0.1
+
+    print("\n=== Derived Dimensionless Simulation Parameters ===")
+    for key, val in {**nl_params, **calc_params}.items():
+        if isinstance(val, (int, float)): print(f"{key:<20} = {val:.4e}")
+    print("==================================================\n")
+
+    # -----------------------------
+    # Simulation Time & Grid
+    # -----------------------------
+    final_tau = 60.0; dt_dimless = 0.001
+    Nx, Ny = 256, 256
+    Lx_um, Ly_um = 150.0, 150.0
+    dx_um, dy_um = Lx_um / Nx, Ly_um / Ny
+
+    # -----------------------------
+    # Simulation Features & Output
+    # -----------------------------
+    use_absorbing_boundaries = True; boundary_width_factor = 0.15; boundary_strength = 10.0
+    pump_profile_type = "LG"; pump_waist_um = 40.0; pump_lg_l = 2; pump_lg_p = 0
+    bec_profile_type = "thomas_fermi"; bec_tf_radius_um = 50.0; bec_noise_amplitude = 0.01
+    real_time_viz = True; viz_update_freq = 100; save_interval_tau = 50.0
+    
+    output_dir = f"CsCavity_BEC_{bec_profile_type}_Pump_{pump_profile_type}_l{pump_lg_l}p{pump_lg_p}"
+    plot_dir = setup_output_directories(output_dir)
+    # Logging setup... (omitted for brevity, original logic is preserved)
+
+    # -----------------------------
+    # Spatial Grid & Wavenumbers
+    # -----------------------------
+    x_um = np.linspace(-Lx_um/2, Lx_um/2, Nx, endpoint=False, dtype=np.float32)
+    y_um = np.linspace(-Ly_um/2, Ly_um/2, Ny, endpoint=False, dtype=np.float32)
+    X_um, Y_um = np.meshgrid(x_um, y_um)
+    kx_um_inv = 2.0 * np.pi * np.fft.fftfreq(Nx, d=dx_um).astype(np.float32)
+    ky_um_inv = 2.0 * np.pi * np.fft.fftfreq(Ny, d=dy_um).astype(np.float32)
+    Kx_um_inv, Ky_um_inv = np.meshgrid(kx_um_inv, ky_um_inv)
+    K_sq_um_inv = Kx_um_inv**2 + Ky_um_inv**2
+    kx_plot_shifted_um_inv = np.fft.fftshift(kx_um_inv); ky_plot_shifted_um_inv = np.fft.fftshift(ky_um_inv)
+    w_s_um = physical_params['w_s_um']
+    K_sq_dimless = K_sq_um_inv * w_s_um**2
+
+    # -----------------------------
+    # Initial Fields & Boundaries
+    # -----------------------------
+    boundaries_mask = create_absorbing_boundaries(X_um, Y_um, Lx_um, Ly_um, boundary_width_factor, boundary_strength) if use_absorbing_boundaries else 1.0
+
+    if bec_profile_type == "thomas_fermi":
+        Psi0 = generate_thomas_fermi_bec(X_um, Y_um, Psi_amp_dimless, bec_tf_radius_um, bec_noise_amplitude)
+    else: # homogeneous
+        Psi0 = Psi_amp_dimless * (np.ones((Ny, Nx), dtype=np.complex64) + generate_noise(Nx, Ny, 1.0, bec_noise_amplitude))
+
+    if pump_profile_type == "LG":
+        F_P = generate_lg_pump(X_um, Y_um, F_amp_dimless, pump_waist_um, pump_lg_l, pump_lg_p, 0.001)
+    else: # Default to homogeneous Gaussian-like pump
+        F_P = np.complex64(F_amp_dimless)
+
+    A0 = (F_P / (1.0 + 1j * nl_params['theta'])).astype(np.complex64) + generate_noise(Nx, Ny, F_amp_dimless, 0.01)
+    
+    initial_atom_number, _ = monitor_conservation(Psi0, dx_um, dy_um)
+    print(f"Initial atom number integral: {initial_atom_number:.3e}")
+
+    # -----------------------------
+    # Time Stepping Prep
+    # -----------------------------
+    Psi_fft, A_fft = np.fft.fft2(Psi0), np.fft.fft2(A0)
+    
+    linear_op_psi = np.exp(nl_params['gpe_prefactor'] * (-1j * K_sq_dimless) * (dt_dimless / 2.0)).astype(np.complex64)
+    linear_op_a = np.exp((-(1.0 + 1j * nl_params['theta']) - 1j * nl_params['alpha_F'] * K_sq_dimless) * (dt_dimless / 2.0)).astype(np.complex64)
+
+    current_tau = 0.0; iteration = 0; k_plot_zoom_factor = 1.5
+    if real_time_viz:
+        fig_viz, im_handles_viz = setup_real_time_viz(Nx, Ny, x_um, y_um, kx_plot_shifted_um_inv, ky_plot_shifted_um_inv, k_plot_zoom_factor)
+    
+    save_fields_plots(np.fft.ifft2(Psi_fft), np.fft.ifft2(A_fft), plot_dir, f"state_tau{current_tau:.2f}", x_um, y_um, kx_plot_shifted_um_inv, ky_plot_shifted_um_inv, k_plot_zoom_factor)
+    next_save_tau = save_interval_tau
+
+    # -----------------------------
+    # Main Evolution Loop (Split-Step Fourier Method)
+    # -----------------------------
+    print("\nStarting simulation loop with RK2 integrator...")
+    while current_tau < final_tau:
+        # --- First half-step in Fourier (k) space (Linear Part) ---
+        Psi_fft *= linear_op_psi
+        A_fft *= linear_op_a
+
+        # --- Full step in real (x) space (Nonlinear Part) using RK2 ---
+        Psi_curr = np.fft.ifft2(Psi_fft)
+        A_curr = np.fft.ifft2(A_fft)
+
+        # RK2 (Midpoint Method) as described in Model Handbook Sec 1.2.5
+        # Store initial state for the step
+        Psi_n, A_n = Psi_curr, A_curr
+        
+        # k1: Calculate derivatives at the start of the step
+        k1_psi, k1_a = calculate_nonlinear_derivatives(Psi_n, A_n, F_P, nl_params)
+
+        # Predictor step: Estimate fields at the midpoint of the time interval
+        Psi_mid = Psi_n + 0.5 * dt_dimless * k1_psi
+        A_mid = A_n + 0.5 * dt_dimless * k1_a
+
+        # k2: Calculate derivatives at the estimated midpoint
+        k2_psi, k2_a = calculate_nonlinear_derivatives(Psi_mid, A_mid, F_P, nl_params)
+        
+        # Corrector step: Update fields using the derivatives from the midpoint
+        Psi_curr = Psi_n + dt_dimless * k2_psi
+        A_curr = A_n + dt_dimless * k2_a
+
+        # --- Apply absorbing boundaries in real space ---
+        if use_absorbing_boundaries:
+            Psi_curr *= boundaries_mask
+            A_curr *= boundaries_mask
+
+        # --- Transform back to Fourier space for the next linear step ---
+        Psi_fft = np.fft.fft2(Psi_curr)
+        A_fft = np.fft.fft2(A_curr)
+
+        # --- Second half-step in Fourier (k) space (Linear Part) ---
+        Psi_fft *= linear_op_psi
+        A_fft *= linear_op_a
+        
+        # --- Update time and check for outputs/instability ---
+        current_tau += dt_dimless; iteration += 1
+
+        if np.any(np.isnan(Psi_fft)) or np.any(np.isnan(A_fft)):
+            print(f"Instability detected at tau = {current_tau:.3f}. Aborting."); break
+
+        if iteration % 200 == 0:
+            num_val, num_change = monitor_conservation(np.fft.ifft2(Psi_fft), dx_um, dy_um, initial_atom_number)
+            print(f"Iter {iteration}, τ={current_tau:.2f}. Atom N change: {num_change:+.2f}%")
+
+        if real_time_viz and (iteration % viz_update_freq == 0):
+            update_real_time_viz(fig_viz, im_handles_viz, np.fft.ifft2(Psi_fft), np.fft.ifft2(A_fft), current_tau)
+            
+        if current_tau >= next_save_tau:
+            save_fields_plots(np.fft.ifft2(Psi_fft), np.fft.ifft2(A_fft), plot_dir, f"state_tau{current_tau:.2f}", x_um, y_um, kx_plot_shifted_um_inv, ky_plot_shifted_um_inv, k_plot_zoom_factor)
+            next_save_tau += save_interval_tau
+            
+    # --- Final state processing ---
+    Psi_final = np.fft.ifft2(Psi_fft) * boundaries_mask
+    A_final = np.fft.ifft2(A_fft) * boundaries_mask
+    save_fields_plots(Psi_final, A_final, plot_dir, "final_state", x_um, y_um, kx_plot_shifted_um_inv, ky_plot_shifted_um_inv, k_plot_zoom_factor)
+    
+    print(f"\nSimulation complete. Final dimensionless time τ = {current_tau:.2f}")
+    if real_time_viz: plt.ioff(); plt.show()
+
+if __name__ == "__main__":
+    main()
